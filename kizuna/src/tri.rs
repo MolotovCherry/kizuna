@@ -2,14 +2,15 @@
 #[macro_export]
 macro_rules! tri {
     ($($code:tt)*) => {{
-        #[allow(clippy::redundant_closure_call)]
-        (|| {
-            $(
-                $code
-            )*
-        })()
+        const fn once<F, Output>(f: F) -> F
+            where F: FnOnce() -> Output
+        {
+            f
+        }
+
+        once(|| { $($code)* })()
     }};
 }
 
-/// Poor mans try {} block
+/// Poor man's try {} block
 pub use tri;
