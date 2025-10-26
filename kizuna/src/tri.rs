@@ -1,6 +1,6 @@
 #[doc(hidden)]
 #[macro_export]
-macro_rules! tri {
+macro_rules! _internal_tri {
     ($($code:tt)*) => {{
         const fn once<F, Output>(f: F) -> F
             where F: FnOnce() -> Output
@@ -13,4 +13,4 @@ macro_rules! tri {
 }
 
 /// Poor man's try {} block
-pub use tri;
+pub use _internal_tri as tri;
