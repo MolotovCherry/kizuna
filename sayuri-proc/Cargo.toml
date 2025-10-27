@@ -3,6 +3,10 @@ name = "sayuri-proc"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+license = "MIT"
+description = "Useful Rust proc utilities"
+repository = "https://github.com/MolotovCherry/sayuri"
+readme = "../README.md"
 
 [lib]
 proc-macro = true
