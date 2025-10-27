@@ -4,5 +4,5 @@ mod tri;
 
 pub mod macros {
     pub use super::tri::tri;
-    pub use kizuna_proc::stringify_raw;
+    pub use sayuri_proc::stringify_raw;
 }
