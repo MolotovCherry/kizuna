@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_System_Memory", "Win32_System_Performance"] }
+windows = { version = "0.62.2", features = ["Win32_System_Memory", "Win32_System_Performance", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 libc =  "0.2.177"
