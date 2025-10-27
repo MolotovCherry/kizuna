@@ -1,9 +1,11 @@
 [package]
 name = "sayuri"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Useful Rust utilities"
+repository = "https://github.com/MolotovCherry/sayuri"
+readme = "../README.md"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_System_Memory", "Win32_System_Performance", "Win32_System_Threading"] }
@@ -12,4 +14,4 @@ windows = { version = "0.62.2", features = ["Win32_System_Memory", "Win32_System
 libc =  "0.2.177"
 
 [dependencies]
-sayuri-proc = "0.1.0"
+sayuri-proc = "0.1.1"
