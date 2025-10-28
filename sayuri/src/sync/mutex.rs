@@ -1,4 +1,4 @@
-use std::sync::{Mutex as StdMutex, MutexGuard};
+use std::sync::{LockResult, Mutex as StdMutex, MutexGuard, TryLockError};
 
 /// A mutual exclusion primitive useful for protecting shared data
 ///
@@ -165,10 +165,7 @@ impl<T> Mutex<T> {
     /// assert_eq!(*mutex.lock(), 10);
     /// ```
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        match self.0.lock() {
-            Ok(t) => t,
-            Err(e) => e.into_inner(),
-        }
+        unwrap_lock(self.0.lock())
     }
 
     /// Attempts to acquire this lock.
@@ -200,7 +197,13 @@ impl<T> Mutex<T> {
     /// assert_eq!(*mutex.lock(), 10);
     /// ```
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        self.0.try_lock().ok()
+        let t = match self.0.try_lock() {
+            Ok(t) => t,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+
+        Some(t)
     }
 
     /// Consumes this mutex, returning the underlying data.
@@ -214,10 +217,7 @@ impl<T> Mutex<T> {
     /// assert_eq!(mutex.into_inner(), 0);
     /// ```
     pub fn into_inner(self) -> T {
-        match self.0.into_inner() {
-            Ok(t) => t,
-            Err(e) => e.into_inner(),
-        }
+        unwrap_lock(self.0.into_inner())
     }
 
     /// Returns a mutable reference to the underlying data.
@@ -239,9 +239,13 @@ impl<T> Mutex<T> {
     ///
     /// [`forget()`]: mem::forget
     pub fn get_mut(&mut self) -> &mut T {
-        match self.0.get_mut() {
-            Ok(t) => t,
-            Err(e) => e.into_inner(),
-        }
+        unwrap_lock(self.0.get_mut())
+    }
+}
+
+fn unwrap_lock<T>(l: LockResult<T>) -> T {
+    match l {
+        Ok(t) => t,
+        Err(e) => e.into_inner(),
     }
 }
