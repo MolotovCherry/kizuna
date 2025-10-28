@@ -28,22 +28,22 @@ dependencies = [
 
 [[package]]
 name = "sayuri"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
- "sayuri-proc 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sayuri-proc 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "windows",
 ]
 
 [[package]]
 name = "sayuri-proc"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sayuri-proc"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2fb5e1c3b815ef9db0ae01c19887001f4d84ac8c608edfb4e5d5c5cb9820270"
+checksum = "bf164aded24a71ce39864eecb586185fae44e14e7a84a552f485d572dd6812e9"
 
 [[package]]
 name = "syn"

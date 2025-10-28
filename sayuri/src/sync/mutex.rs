@@ -1,160 +1,123 @@
-mod futex;
-mod sys;
+use std::sync::{Mutex as StdMutex, MutexGuard};
 
-use std::cell::UnsafeCell;
-use std::fmt;
-use std::marker::PhantomData;
-use std::mem::{self, ManuallyDrop};
-use std::ops::{Deref, DerefMut};
-use std::ptr::NonNull;
-
-/// A type alias for the result of a nonblocking locking method.
-pub type TryLockResult<Guard> = Result<Guard, WouldBlock>;
-
-/// A lock could not be acquired at this time because the operation would otherwise block.
-pub struct WouldBlock;
-
-impl fmt::Debug for WouldBlock {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        "WouldBlock".fmt(f)
-    }
-}
-
-impl fmt::Display for WouldBlock {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        "try_lock failed because the operation would block".fmt(f)
-    }
-}
-
-/// A mutual exclusion primitive useful for protecting shared data that does not keep track of
-/// lock poisoning.
+/// A mutual exclusion primitive useful for protecting shared data
 ///
-/// For more information about mutexes, check out the documentation for the poisoning variant of
-/// this lock at [`poison::Mutex`].
-///
-/// [`poison::Mutex`]: crate::sync::poison::Mutex
+/// This mutex will block threads waiting for the lock to become available. The
+/// mutex can be created via a [`new`] constructor. Each mutex has a type parameter
+/// which represents the data that it is protecting. The data can only be accessed
+/// through the RAII guards returned from [`lock`] and [`try_lock`], which
+/// guarantees that the data is only ever accessed when the mutex is locked.
 ///
 /// # Examples
 ///
-/// Note that this `Mutex` does **not** propagate threads that panic while holding the lock via
-/// poisoning. If you need this functionality, see [`poison::Mutex`].
-///
 /// ```
-/// #![feature(nonpoison_mutex)]
-///
+/// use std::sync::Arc;
 /// use std::thread;
-/// use std::sync::{Arc, nonpoison::Mutex};
+/// use std::sync::mpsc::channel;
+/// use sayuri::sync::Mutex;
 ///
-/// let mutex = Arc::new(Mutex::new(0u32));
-/// let mut handles = Vec::new();
+/// const N: usize = 10;
 ///
-/// for n in 0..10 {
-///     let m = Arc::clone(&mutex);
-///     let handle = thread::spawn(move || {
-///         let mut guard = m.lock();
-///         *guard += 1;
-///         panic!("panic from thread {n} {guard}")
+/// // Spawn a few threads to increment a shared variable (non-atomically), and
+/// // let the main thread know once all increments are done.
+/// //
+/// // Here we're using an Arc to share memory among threads, and the data inside
+/// // the Arc is protected with a mutex.
+/// let data = Arc::new(Mutex::new(0));
+///
+/// let (tx, rx) = channel();
+/// for _ in 0..N {
+///     let (data, tx) = (Arc::clone(&data), tx.clone());
+///     thread::spawn(move || {
+///         // The shared state can only be accessed once the lock is held.
+///         // Our non-atomic increment is safe because we're the only thread
+///         // which can access the shared state when the lock is held.
+///         let mut data = data.lock();
+///         *data += 1;
+///         if *data == N {
+///             tx.send(()).unwrap();
+///         }
+///         // the lock is unlocked here when `data` goes out of scope.
 ///     });
-///     handles.push(handle);
 /// }
 ///
-/// for h in handles {
-///     let _ = h.join();
-/// }
-///
-/// println!("Finished, locked {} times", mutex.lock());
+/// rx.recv().unwrap();
 /// ```
-pub struct Mutex<T: ?Sized> {
-    inner: sys::Mutex,
-    data: UnsafeCell<T>,
+///
+/// To unlock a mutex guard sooner than the end of the enclosing scope,
+/// either create an inner scope or drop the guard manually.
+///
+/// ```
+/// use std::sync::Arc;
+/// use std::thread;
+/// use sayuri::sync::Mutex;
+///
+/// const N: usize = 3;
+///
+/// let data_mutex = Arc::new(Mutex::new(vec![1, 2, 3, 4]));
+/// let res_mutex = Arc::new(Mutex::new(0));
+///
+/// let mut threads = Vec::with_capacity(N);
+/// (0..N).for_each(|_| {
+///     let data_mutex_clone = Arc::clone(&data_mutex);
+///     let res_mutex_clone = Arc::clone(&res_mutex);
+///
+///     threads.push(thread::spawn(move || {
+///         // Here we use a block to limit the lifetime of the lock guard.
+///         let result = {
+///             let mut data = data_mutex_clone.lock();
+///             // This is the result of some important and long-ish work.
+///             let result = data.iter().fold(0, |acc, x| acc + x * 2);
+///             data.push(result);
+///             result
+///             // The mutex guard gets dropped here, together with any other values
+///             // created in the critical section.
+///         };
+///         // The guard created here is a temporary dropped at the end of the statement, i.e.
+///         // the lock would not remain being held even if the thread did some additional work.
+///         *res_mutex_clone.lock() += result;
+///     }));
+/// });
+///
+/// let mut data = data_mutex.lock();
+/// // This is the result of some important and long-ish work.
+/// let result = data.iter().fold(0, |acc, x| acc + x * 2);
+/// data.push(result);
+/// // We drop the `data` explicitly because it's not necessary anymore and the
+/// // thread still has work to do. This allows other threads to start working on
+/// // the data immediately, without waiting for the rest of the unrelated work
+/// // to be done here.
+/// //
+/// // It's even more important here than in the threads because we `.join` the
+/// // threads after that. If we had not dropped the mutex guard, a thread could
+/// // be waiting forever for it, causing a deadlock.
+/// // As in the threads, a block could have been used instead of calling the
+/// // `drop` function.
+/// drop(data);
+/// // Here the mutex guard is not assigned to a variable and so, even if the
+/// // scope does not end after this line, the mutex is still released: there is
+/// // no deadlock.
+/// *res_mutex.lock() += result;
+///
+/// threads.into_iter().for_each(|thread| {
+///     thread
+///         .join()
+///         .expect("The thread creating or execution failed !")
+/// });
+///
+/// assert_eq!(*res_mutex.lock(), 800);
+/// ```
+///
+#[derive(Debug, Default)]
+pub struct Mutex<T: ?Sized>(StdMutex<T>);
+
+impl<T> From<T> for Mutex<T> {
+    /// Creates a new mutex in an unlocked state ready for use.
+    /// This is equivalent to [`Mutex::new`].
+    fn from(t: T) -> Self {
+        Mutex::new(t)
+    }
 }
-
-/// `T` must be `Send` for a [`Mutex`] to be `Send` because it is possible to acquire
-/// the owned `T` from the `Mutex` via [`into_inner`].
-///
-/// [`into_inner`]: Mutex::into_inner
-unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
-
-/// `T` must be `Send` for [`Mutex`] to be `Sync`.
-/// This ensures that the protected data can be accessed safely from multiple threads
-/// without causing data races or other unsafe behavior.
-///
-/// [`Mutex<T>`] provides mutable access to `T` to one thread at a time. However, it's essential
-/// for `T` to be `Send` because it's not safe for non-`Send` structures to be accessed in
-/// this manner. For instance, consider [`Rc`], a non-atomic reference counted smart pointer,
-/// which is not `Send`. With `Rc`, we can have multiple copies pointing to the same heap
-/// allocation with a non-atomic reference count. If we were to use `Mutex<Rc<_>>`, it would
-/// only protect one instance of `Rc` from shared access, leaving other copies vulnerable
-/// to potential data races.
-///
-/// Also note that it is not necessary for `T` to be `Sync` as `&T` is only made available
-/// to one thread at a time if `T` is not `Sync`.
-///
-/// [`Rc`]: crate::rc::Rc
-unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
-
-/// An RAII implementation of a "scoped lock" of a mutex. When this structure is
-/// dropped (falls out of scope), the lock will be unlocked.
-///
-/// The data protected by the mutex can be accessed through this guard via its
-/// [`Deref`] and [`DerefMut`] implementations.
-///
-/// This structure is created by the [`lock`] and [`try_lock`] methods on
-/// [`Mutex`].
-///
-/// [`lock`]: Mutex::lock
-/// [`try_lock`]: Mutex::try_lock
-///
-/// Is not `Send` to maximize platform portability.
-///
-/// On platforms that use POSIX threads (commonly referred to as pthreads) there is a requirement to
-/// release mutex locks on the same thread they were acquired.
-/// For this reason, [`MutexGuard`] must not implement `Send` to prevent it being dropped from
-/// another thread.
-#[must_use = "if unused the Mutex will immediately unlock"]
-#[clippy::has_significant_drop]
-pub struct MutexGuard<'a, T: ?Sized + 'a> {
-    lock: &'a Mutex<T>,
-    // remove Sendness
-    _phantom: PhantomData<*const ()>,
-}
-
-/// `T` must be `Sync` for a [`MutexGuard<T>`] to be `Sync`
-/// because it is possible to get a `&T` from `&MutexGuard` (via `Deref`).
-unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
-
-/// An RAII mutex guard returned by `MutexGuard::map`, which can point to a
-/// subfield of the protected data. When this structure is dropped (falls out
-/// of scope), the lock will be unlocked.
-///
-/// The main difference between `MappedMutexGuard` and [`MutexGuard`] is that the
-/// former cannot be used with [`Condvar`], since that could introduce soundness issues if the
-/// locked object is modified by another thread while the `Mutex` is unlocked.
-///
-/// The data protected by the mutex can be accessed through this guard via its
-/// [`Deref`] and [`DerefMut`] implementations.
-///
-/// This structure is created by the [`map`] and [`filter_map`] methods on
-/// [`MutexGuard`].
-///
-/// [`map`]: MutexGuard::map
-/// [`filter_map`]: MutexGuard::filter_map
-/// [`Condvar`]: crate::sync::nonpoison::Condvar
-#[must_use = "if unused the Mutex will immediately unlock"]
-#[clippy::has_significant_drop]
-pub struct MappedMutexGuard<'a, T: ?Sized + 'a> {
-    // NB: we use a pointer instead of `&'a mut T` to avoid `noalias` violations, because a
-    // `MappedMutexGuard` argument doesn't hold uniqueness for its whole scope, only until it drops.
-    // `NonNull` is covariant over `T`, so we add a `PhantomData<&'a mut T>` field
-    // below for the correct variance over `T` (invariance).
-    data: NonNull<T>,
-    inner: &'a sys::Mutex,
-    _variance: PhantomData<&'a mut T>,
-    // remove Sendness
-    _phantom: PhantomData<*mut T>,
-}
-
-unsafe impl<T: ?Sized + Sync> Sync for MappedMutexGuard<'_, T> {}
 
 impl<T> Mutex<T> {
     /// Creates a new mutex in an unlocked state ready for use.
@@ -162,92 +125,14 @@ impl<T> Mutex<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(nonpoison_mutex)]
-    ///
-    /// use std::sync::nonpoison::Mutex;
+    /// use sayuri::sync::Mutex;
     ///
     /// let mutex = Mutex::new(0);
     /// ```
-    #[inline]
-    pub const fn new(t: T) -> Mutex<T> {
-        Mutex {
-            inner: sys::Mutex::new(),
-            data: UnsafeCell::new(t),
-        }
+    pub const fn new(t: T) -> Self {
+        Self(StdMutex::new(t))
     }
 
-    /// Returns the contained value by cloning it.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(nonpoison_mutex)]
-    /// #![feature(lock_value_accessors)]
-    ///
-    /// use std::sync::nonpoison::Mutex;
-    ///
-    /// let mut mutex = Mutex::new(7);
-    ///
-    /// assert_eq!(mutex.get_cloned(), 7);
-    /// ```
-    // #[unstable(feature = "nonpoison_mutex", issue = "134645")]
-    pub fn get_cloned(&self) -> T
-    where
-        T: Clone,
-    {
-        self.lock().clone()
-    }
-
-    /// Sets the contained value.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(nonpoison_mutex)]
-    /// #![feature(lock_value_accessors)]
-    ///
-    /// use std::sync::nonpoison::Mutex;
-    ///
-    /// let mut mutex = Mutex::new(7);
-    ///
-    /// assert_eq!(mutex.get_cloned(), 7);
-    /// mutex.set(11);
-    /// assert_eq!(mutex.get_cloned(), 11);
-    /// ```
-    // #[unstable(feature = "nonpoison_mutex", issue = "134645")]
-    pub fn set(&self, value: T) {
-        if mem::needs_drop::<T>() {
-            // If the contained value has a non-trivial destructor, we
-            // call that destructor after the lock has been released.
-            drop(self.replace(value))
-        } else {
-            *self.lock() = value;
-        }
-    }
-
-    /// Replaces the contained value with `value`, and returns the old contained value.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(nonpoison_mutex)]
-    /// #![feature(lock_value_accessors)]
-    ///
-    /// use std::sync::nonpoison::Mutex;
-    ///
-    /// let mut mutex = Mutex::new(7);
-    ///
-    /// assert_eq!(mutex.replace(11), 7);
-    /// assert_eq!(mutex.get_cloned(), 11);
-    /// ```
-    // #[unstable(feature = "nonpoison_mutex", issue = "134645")]
-    pub fn replace(&self, value: T) -> T {
-        let mut guard = self.lock();
-        mem::replace(&mut *guard, value)
-    }
-}
-
-impl<T: ?Sized> Mutex<T> {
     /// Acquires a mutex, blocking the current thread until it is able to do so.
     ///
     /// This function will block the local thread until it is available to acquire
@@ -267,10 +152,9 @@ impl<T: ?Sized> Mutex<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(nonpoison_mutex)]
-    ///
-    /// use std::sync::{Arc, nonpoison::Mutex};
+    /// use std::sync::Arc;
     /// use std::thread;
+    /// use sayuri::sync::Mutex;
     ///
     /// let mutex = Arc::new(Mutex::new(0));
     /// let c_mutex = Arc::clone(&mutex);
@@ -281,51 +165,42 @@ impl<T: ?Sized> Mutex<T> {
     /// assert_eq!(*mutex.lock(), 10);
     /// ```
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        unsafe {
-            self.inner.lock();
-            MutexGuard::new(self)
+        match self.0.lock() {
+            Ok(t) => t,
+            Err(e) => e.into_inner(),
         }
     }
 
     /// Attempts to acquire this lock.
     ///
-    /// This function does not block. If the lock could not be acquired at this time, then
-    /// [`WouldBlock`] is returned. Otherwise, an RAII guard is returned.
+    /// If the lock could not be acquired at this time, then [`None`] is returned.
+    /// Otherwise, an RAII guard is returned. The lock will be unlocked when the
+    /// guard is dropped.
     ///
-    /// The lock will be unlocked when the guard is dropped.
-    ///
-    /// # Errors
-    ///
-    /// If the mutex could not be acquired because it is already locked, then this call will return
-    /// the [`WouldBlock`] error.
+    /// This function does not block.
     ///
     /// # Examples
     ///
     /// ```
-    /// use std::sync::{Arc, Mutex};
+    /// use std::sync::Arc;
     /// use std::thread;
+    /// use sayuri::sync::Mutex;
     ///
     /// let mutex = Arc::new(Mutex::new(0));
     /// let c_mutex = Arc::clone(&mutex);
     ///
     /// thread::spawn(move || {
     ///     let mut lock = c_mutex.try_lock();
-    ///     if let Ok(ref mut mutex) = lock {
+    ///     if let Some(ref mut mutex) = lock {
     ///         **mutex = 10;
     ///     } else {
     ///         println!("try_lock failed");
     ///     }
     /// }).join().expect("thread::spawn failed");
-    /// assert_eq!(*mutex.lock().unwrap(), 10);
+    /// assert_eq!(*mutex.lock(), 10);
     /// ```
-    pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
-        unsafe {
-            if self.inner.try_lock() {
-                Ok(MutexGuard::new(self))
-            } else {
-                Err(WouldBlock)
-            }
-        }
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        self.0.try_lock().ok()
     }
 
     /// Consumes this mutex, returning the underlying data.
@@ -333,312 +208,40 @@ impl<T: ?Sized> Mutex<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(nonpoison_mutex)]
-    ///
-    /// use std::sync::nonpoison::Mutex;
+    /// use sayuri::sync::Mutex;
     ///
     /// let mutex = Mutex::new(0);
     /// assert_eq!(mutex.into_inner(), 0);
     /// ```
-    pub fn into_inner(self) -> T
-    where
-        T: Sized,
-    {
-        self.data.into_inner()
+    pub fn into_inner(self) -> T {
+        match self.0.into_inner() {
+            Ok(t) => t,
+            Err(e) => e.into_inner(),
+        }
     }
 
     /// Returns a mutable reference to the underlying data.
     ///
     /// Since this call borrows the `Mutex` mutably, no actual locking needs to
-    /// take place -- the mutable borrow statically guarantees no locks exist.
+    /// take place -- the mutable borrow statically guarantees no new locks can be acquired
+    /// while this reference exists. Note that this method does not clear any previous abandoned locks
+    /// (e.g., via [`forget()`] on a [`MutexGuard`]).
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(nonpoison_mutex)]
-    ///
-    /// use std::sync::nonpoison::Mutex;
+    /// use sayuri::sync::Mutex;
     ///
     /// let mut mutex = Mutex::new(0);
     /// *mutex.get_mut() = 10;
     /// assert_eq!(*mutex.lock(), 10);
     /// ```
+    ///
+    /// [`forget()`]: mem::forget
     pub fn get_mut(&mut self) -> &mut T {
-        self.data.get_mut()
-    }
-
-    /// Returns a raw pointer to the underlying data.
-    ///
-    /// The returned pointer is always non-null and properly aligned, but it is
-    /// the user's responsibility to ensure that any reads and writes through it
-    /// are properly synchronized to avoid data races, and that it is not read
-    /// or written through after the mutex is dropped.
-    pub const fn data_ptr(&self) -> *mut T {
-        self.data.get()
-    }
-
-    /// Acquires the mutex and provides mutable access to the underlying data by passing
-    /// a mutable reference to the given closure.
-    ///
-    /// This method acquires the lock, calls the provided closure with a mutable reference
-    /// to the data, and returns the result of the closure. The lock is released after
-    /// the closure completes, even if it panics.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(lock_value_accessors, nonpoison_mutex)]
-    ///
-    /// use std::sync::nonpoison::Mutex;
-    ///
-    /// let mutex = Mutex::new(2);
-    ///
-    /// let result = mutex.with_mut(|data| {
-    ///     *data += 3;
-    ///
-    ///     *data + 5
-    /// });
-    ///
-    /// assert_eq!(*mutex.lock(), 5);
-    /// assert_eq!(result, 10);
-    /// ```
-    pub fn with_mut<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut T) -> R,
-    {
-        f(&mut self.lock())
-    }
-}
-
-impl<T> From<T> for Mutex<T> {
-    /// Creates a new mutex in an unlocked state ready for use.
-    /// This is equivalent to [`Mutex::new`].
-    fn from(t: T) -> Self {
-        Mutex::new(t)
-    }
-}
-
-impl<T: Default> Default for Mutex<T> {
-    /// Creates a `Mutex<T>`, with the `Default` value for T.
-    fn default() -> Mutex<T> {
-        Mutex::new(Default::default())
-    }
-}
-
-impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut d = f.debug_struct("Mutex");
-        match self.try_lock() {
-            Ok(guard) => {
-                d.field("data", &&*guard);
-            }
-            Err(WouldBlock) => {
-                d.field("data", &"<locked>");
-            }
-        }
-        d.finish_non_exhaustive()
-    }
-}
-
-impl<'mutex, T: ?Sized> MutexGuard<'mutex, T> {
-    unsafe fn new(lock: &'mutex Mutex<T>) -> MutexGuard<'mutex, T> {
-        MutexGuard {
-            lock,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T: ?Sized> Deref for MutexGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        unsafe { &*self.lock.data.get() }
-    }
-}
-
-impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.lock.data.get() }
-    }
-}
-
-impl<T: ?Sized> Drop for MutexGuard<'_, T> {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            self.lock.inner.unlock();
-        }
-    }
-}
-
-impl<T: ?Sized + fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<T: ?Sized + fmt::Display> fmt::Display for MutexGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (**self).fmt(f)
-    }
-}
-
-impl<'a, T: ?Sized> MutexGuard<'a, T> {
-    /// Makes a [`MappedMutexGuard`] for a component of the borrowed data, e.g.
-    /// an enum variant.
-    ///
-    /// The `Mutex` is already locked, so this cannot fail.
-    ///
-    /// This is an associated function that needs to be used as
-    /// `MutexGuard::map(...)`. A method would interfere with methods of the
-    /// same name on the contents of the `MutexGuard` used through `Deref`.
-    pub fn map<U, F>(orig: Self, f: F) -> MappedMutexGuard<'a, U>
-    where
-        F: FnOnce(&mut T) -> &mut U,
-        U: ?Sized,
-    {
-        // SAFETY: the conditions of `MutexGuard::new` were satisfied when the original guard
-        // was created, and have been upheld throughout `map` and/or `filter_map`.
-        // The signature of the closure guarantees that it will not "leak" the lifetime of the reference
-        // passed to it. If the closure panics, the guard will be dropped.
-        let data = NonNull::from(f(unsafe { &mut *orig.lock.data.get() }));
-        let orig = ManuallyDrop::new(orig);
-        MappedMutexGuard {
-            data,
-            inner: &orig.lock.inner,
-            _variance: PhantomData,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Makes a [`MappedMutexGuard`] for a component of the borrowed data. The
-    /// original guard is returned as an `Err(...)` if the closure returns
-    /// `None`.
-    ///
-    /// The `Mutex` is already locked, so this cannot fail.
-    ///
-    /// This is an associated function that needs to be used as
-    /// `MutexGuard::filter_map(...)`. A method would interfere with methods of the
-    /// same name on the contents of the `MutexGuard` used through `Deref`.
-    pub fn filter_map<U, F>(orig: Self, f: F) -> Result<MappedMutexGuard<'a, U>, Self>
-    where
-        F: FnOnce(&mut T) -> Option<&mut U>,
-        U: ?Sized,
-    {
-        // SAFETY: the conditions of `MutexGuard::new` were satisfied when the original guard
-        // was created, and have been upheld throughout `map` and/or `filter_map`.
-        // The signature of the closure guarantees that it will not "leak" the lifetime of the reference
-        // passed to it. If the closure panics, the guard will be dropped.
-        match f(unsafe { &mut *orig.lock.data.get() }) {
-            Some(data) => {
-                let data = NonNull::from(data);
-                let orig = ManuallyDrop::new(orig);
-                Ok(MappedMutexGuard {
-                    data,
-                    inner: &orig.lock.inner,
-                    _variance: PhantomData,
-                    _phantom: PhantomData,
-                })
-            }
-            None => Err(orig),
-        }
-    }
-}
-
-impl<T: ?Sized> Deref for MappedMutexGuard<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        unsafe { self.data.as_ref() }
-    }
-}
-
-impl<T: ?Sized> DerefMut for MappedMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { self.data.as_mut() }
-    }
-}
-
-impl<T: ?Sized> Drop for MappedMutexGuard<'_, T> {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            self.inner.unlock();
-        }
-    }
-}
-
-impl<T: ?Sized + fmt::Debug> fmt::Debug for MappedMutexGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<T: ?Sized + fmt::Display> fmt::Display for MappedMutexGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (**self).fmt(f)
-    }
-}
-
-impl<'a, T: ?Sized> MappedMutexGuard<'a, T> {
-    /// Makes a [`MappedMutexGuard`] for a component of the borrowed data, e.g.
-    /// an enum variant.
-    ///
-    /// The `Mutex` is already locked, so this cannot fail.
-    ///
-    /// This is an associated function that needs to be used as
-    /// `MappedMutexGuard::map(...)`. A method would interfere with methods of the
-    /// same name on the contents of the `MutexGuard` used through `Deref`.
-    pub fn map<U, F>(mut orig: Self, f: F) -> MappedMutexGuard<'a, U>
-    where
-        F: FnOnce(&mut T) -> &mut U,
-        U: ?Sized,
-    {
-        // SAFETY: the conditions of `MutexGuard::new` were satisfied when the original guard
-        // was created, and have been upheld throughout `map` and/or `filter_map`.
-        // The signature of the closure guarantees that it will not "leak" the lifetime of the reference
-        // passed to it. If the closure panics, the guard will be dropped.
-        let data = NonNull::from(f(unsafe { orig.data.as_mut() }));
-        let orig = ManuallyDrop::new(orig);
-        MappedMutexGuard {
-            data,
-            inner: orig.inner,
-            _variance: PhantomData,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// Makes a [`MappedMutexGuard`] for a component of the borrowed data. The
-    /// original guard is returned as an `Err(...)` if the closure returns
-    /// `None`.
-    ///
-    /// The `Mutex` is already locked, so this cannot fail.
-    ///
-    /// This is an associated function that needs to be used as
-    /// `MappedMutexGuard::filter_map(...)`. A method would interfere with methods of the
-    /// same name on the contents of the `MutexGuard` used through `Deref`.
-    pub fn filter_map<U, F>(mut orig: Self, f: F) -> Result<MappedMutexGuard<'a, U>, Self>
-    where
-        F: FnOnce(&mut T) -> Option<&mut U>,
-        U: ?Sized,
-    {
-        // SAFETY: the conditions of `MutexGuard::new` were satisfied when the original guard
-        // was created, and have been upheld throughout `map` and/or `filter_map`.
-        // The signature of the closure guarantees that it will not "leak" the lifetime of the reference
-        // passed to it. If the closure panics, the guard will be dropped.
-        match f(unsafe { orig.data.as_mut() }) {
-            Some(data) => {
-                let data = NonNull::from(data);
-                let orig = ManuallyDrop::new(orig);
-                Ok(MappedMutexGuard {
-                    data,
-                    inner: orig.inner,
-                    _variance: PhantomData,
-                    _phantom: PhantomData,
-                })
-            }
-            None => Err(orig),
+        match self.0.get_mut() {
+            Ok(t) => t,
+            Err(e) => e.into_inner(),
         }
     }
 }
